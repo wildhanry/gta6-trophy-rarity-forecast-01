@@ -12,12 +12,18 @@ case file in the input directory it writes five quantiles (5%, 25%, 50%,
 The model works per trophy on the logit of the observed rates: a
 recency-weighted linear fit estimates each trophy's drift, that drift is
 shrunk toward the cross-trophy median drift according to how precisely it
-is measured, the extrapolation over the forecast horizon is damped so a
-short window cannot project an extreme move a week out, and the predictive
-spread combines a random-walk term, the fit's residual scale, and the
-uncertainty of the shrunk drift. Histories that are too short, rates that
-are missing in the last read, and rates pinned at 0% or 100% all fall back
-to guarded behaviour instead of failing.
+is measured, and the extrapolation over the forecast horizon is damped so
+a short window cannot project an extreme move a week out. A second,
+count-based view (earners versus players tracked, each grown over the
+same damped horizon) never moves the median - backtests rejected that -
+but disagreement between the two views widens the predictive spread,
+which also combines a random-walk term, the fit's residual scale, the
+uncertainty of the shrunk drift, and a refresh-jump allowance; both that
+allowance and the spread floor grow with the horizon, so minutes-ahead
+forecasts stay tight while week-ahead forecasts stay honest. Histories
+that are too short, rates that are missing in the last read, and rates
+pinned at 0% or 100% all fall back to guarded behaviour instead of
+failing.
 
 Python 3.13, standard library only, no network access, no randomness:
 the same case always produces the same output bytes.

@@ -24,12 +24,28 @@ Model, per trophy
    The anchor is a blend of the last observed logit (65%) and the fitted
    line's value at the last read (35%), which trims rounding noise from
    rates printed to two decimals without drifting away from the last read.
-4. Predictive spread (the sigma multiplied by each level's normal z):
+4. A count view, used as an uncertainty signal - not as a second median.
+   A rate is earners / players, and the two sides move for different
+   reasons: new players dilute a rate, existing players earning trophies
+   raise it. The same weighted fit is run on log(players tracked) once
+   per case and on log(earners + 0.75) per trophy (earners reconstructed
+   as rate * players / 100), each slope shrunk toward its cross-trophy
+   median and extrapolated over the same damped horizon, giving an
+   implied rate at the target. An earlier version of this entry blended
+   that implied rate into the median; backtests rejected that (it helped
+   a count-generated scenario slightly but cost more on static data,
+   where the count view is mostly rounding noise). What survives is the
+   disagreement: when the count view and the logit view point apart,
+   that gap is genuine model uncertainty, so it widens the spread.
+5. Predictive spread (the sigma multiplied by each level's normal z):
    a random-walk term 0.5 * sqrt(H days), as in the house baseline, plus
    the fit's residual scale, plus the shrunk slope's uncertainty projected
-   over the damped horizon, plus a small constant allowance for the jump
-   an Exophase refresh can cause between reads. The total is floored and
-   capped so no trophy gets a degenerate or an absurd band.
+   over the damped horizon, plus an allowance for the jump an Exophase
+   refresh can cause between reads. Both the allowance and the spread
+   floor grow with the horizon - a refresh is unlikely inside half an
+   hour and near-certain inside a week - from near zero for very short
+   horizons to their full values for the final's multi-day horizon, and
+   the total spread is capped so no trophy gets an absurd band.
 
 Fallbacks: a trophy with fewer than two usable reads keeps its last logit
 (or the case-wide median logit if it was never observed) and takes the
@@ -64,9 +80,17 @@ DAMP_TAU_DAYS = 2.5      # horizon damping scale for drift extrapolation
 MAX_LOGIT_MOVE = 3.0     # hard cap on the extrapolated logit change
 RW_SIGMA = 0.5           # random-walk logit spread per sqrt(day)
 MIN_SLOPE_SE = 0.08      # per-day floor on slope uncertainty (rounding)
-REFRESH_ALLOWANCE = 0.12  # constant logit allowance for refresh jumps
-MIN_SPREAD = 0.22        # predictive sigma floor, logit units
+SPREAD_FLOOR_SHORT = 0.06  # predictive sigma floor as the horizon -> 0
+SPREAD_FLOOR_LONG = 0.22   # predictive sigma floor for multi-day horizons
+FLOOR_TAU_DAYS = 1.0       # how fast the floor grows with the horizon
+REFRESH_MAX = 0.22         # logit allowance for refresh jumps, long horizon
+REFRESH_TAU_DAYS = 1.5     # how fast that allowance grows with the horizon
 MAX_SPREAD = 2.75        # predictive sigma cap, logit units
+COUNT_PSEUDO = 0.75        # pseudocount (earners) inside the log count fit
+COUNT_MAX_DEVIATION = 2.0  # cap on the count view's logit distance used
+DISAGREE_COEF = 0.35       # share of the model disagreement added to spread
+DISAGREE_CAP = 0.6         # cap on that spread contribution, logit units
+MAX_COUNT_SLOPE = 1.5      # per-day cap on log count growth slopes
 
 _NORMAL = NormalDist()
 
@@ -154,9 +178,25 @@ def weighted_line_fit(xs, ys, ws):
     return anchor, slope, se_slope, resid_sd, n_eff
 
 
+def spread_floor(horizon_days):
+    """Sigma floor that is small for minutes-ahead forecasts and reaches
+    its full value once the horizon is measured in days."""
+    growth = 1.0 - math.exp(-horizon_days / FLOOR_TAU_DAYS) if horizon_days > 0 else 0.0
+    return SPREAD_FLOOR_SHORT + (SPREAD_FLOOR_LONG - SPREAD_FLOOR_SHORT) * growth
+
+
+def refresh_allowance(horizon_days):
+    """Logit allowance for an Exophase refresh jump between the last read
+    and the target; the chance of at least one refresh grows with time."""
+    if horizon_days <= 0:
+        return 0.0
+    return REFRESH_MAX * (1.0 - math.exp(-horizon_days / REFRESH_TAU_DAYS))
+
+
 def collect_series(case):
-    """Per trophy index: list of (days, rate) for non-null reads, plus the
-    list of read times. Times prefer the read's slot over its timestamp."""
+    """Per trophy index: list of (days, rate, players) for non-null reads,
+    plus the list of read times and the (days, players) series. Times
+    prefer the read's slot over its timestamp."""
     history = case.get("history") or []
     read_times = []
     for read in history:
@@ -164,44 +204,94 @@ def collect_series(case):
         read_times.append(stamp)
     trophies = case.get("trophies") or []
     series = [[] for _ in trophies]
+    players_series = []
     for read, stamp in zip(history, read_times):
         if stamp is None:
             continue
+        players = read.get("players_tracked")
+        if players is not None and float(players) > 0:
+            players_series.append((stamp, float(players)))
         rates = read.get("rates") or []
         for idx in range(min(len(trophies), len(rates))):
             rate = rates[idx]
             if rate is not None:
-                series[idx].append((stamp, float(rate)))
-    return series, read_times
+                series[idx].append((stamp, float(rate), players))
+    return series, read_times, players_series
+
+
+def fit_players_target(players_series, last_time, damped_horizon):
+    """Forecast players tracked at the target from a recency-weighted fit
+    of log(players); returns None when the series cannot support one."""
+    if len(players_series) < 2 or last_time is None:
+        if players_series:
+            return players_series[-1][1]
+        return None
+    xs = []
+    ys = []
+    ws = []
+    for stamp, players in players_series:
+        age = last_time - stamp
+        xs.append(-age)
+        ys.append(math.log(players))
+        ws.append(max(WEIGHT_FLOOR, 0.5 ** (age / HALF_LIFE_DAYS)))
+    fit = weighted_line_fit(xs, ys, ws)
+    last_players = players_series[-1][1]
+    if fit is None:
+        return last_players
+    slope = min(MAX_COUNT_SLOPE, max(-MAX_COUNT_SLOPE, fit[1]))
+    target = last_players * math.exp(slope * damped_horizon)
+    return max(1.0, target)
 
 
 def fit_trophy(points, last_time):
-    """First-pass per-trophy fit summary (no shrinkage yet)."""
+    """First-pass per-trophy fit summary (no shrinkage yet): a logit fit
+    for the rate itself and a log fit for the earner count behind it."""
     if not points:
         return None
     last_logit = logit_of_pct(points[-1][1])
+    earners_last = None
+    if points[-1][2] is not None:
+        earners_last = points[-1][1] * float(points[-1][2]) / 100.0
     if len(points) < 3:
         return {
             "last_logit": last_logit,
             "fit": None,
-            "distinct": len({rate for _, rate in points}),
+            "distinct": len({rate for _, rate, _ in points}),
             "span_days": 0.0,
+            "count_fit": None,
+            "earners_last": earners_last,
+            "distinct_earners": 0,
         }
     xs = []
     ys = []
     ws = []
-    for stamp, rate in points:
+    cxs = []
+    cys = []
+    cws = []
+    earners_seen = []
+    for stamp, rate, players in points:
         age = last_time - stamp
+        weight = max(WEIGHT_FLOOR, 0.5 ** (age / HALF_LIFE_DAYS))
         xs.append(-age)  # x = days relative to the last read, so a = level there
         ys.append(logit_of_pct(rate))
-        ws.append(max(WEIGHT_FLOOR, 0.5 ** (age / HALF_LIFE_DAYS)))
+        ws.append(weight)
+        if players is not None and float(players) > 0:
+            earners = rate * float(players) / 100.0
+            earners_seen.append(round(earners, 3))
+            cxs.append(-age)
+            cys.append(math.log(earners + COUNT_PSEUDO))
+            cws.append(weight)
     fit = weighted_line_fit(xs, ys, ws)
+    count_fit = weighted_line_fit(cxs, cys, cws) if len(cxs) >= 3 else None
     span = points[-1][0] - points[0][0]
     return {
         "last_logit": last_logit,
         "fit": fit,
-        "distinct": len({rate for _, rate in points}),
+        "distinct": len({rate for _, rate, _ in points}),
         "span_days": span,
+        "count_fit": count_fit,
+        "earners_last": earners_last,
+        "distinct_earners": len(set(earners_seen)),
     }
 
 
@@ -209,7 +299,7 @@ def forecast_case(case):
     levels = case.get("levels") or DEFAULT_LEVELS
     z_scores = [_NORMAL.inv_cdf(level) for level in levels]
     trophies = case.get("trophies") or []
-    series, read_times = collect_series(case)
+    series, read_times, players_series = collect_series(case)
 
     known_times = [t for t in read_times if t is not None]
     last_time = known_times[-1] if known_times else None
@@ -234,6 +324,7 @@ def forecast_case(case):
             summaries.append(None if not points else {
                 "last_logit": logit_of_pct(points[-1][1]),
                 "fit": None, "distinct": 1, "span_days": 0.0,
+                "count_fit": None, "earners_last": None, "distinct_earners": 0,
             })
         else:
             summaries.append(fit_trophy(points, last_time))
@@ -254,7 +345,19 @@ def forecast_case(case):
     last_logits = [s["last_logit"] for s in summaries if s]
     level_fallback = median(last_logits) if last_logits else logit_of_pct(1.0)
 
+    # Cross-trophy centre and scale for the earner-count growth slopes.
+    count_slopes = [s["count_fit"][1] for s in summaries
+                    if s and s.get("count_fit") is not None]
+    if count_slopes:
+        count_centre = median(count_slopes)
+        count_mad = median([abs(g - count_centre) for g in count_slopes])
+        count_scale = min(0.75, max(0.05, 1.4826 * count_mad))
+    else:
+        count_centre = 0.0
+        count_scale = 0.2
+
     damped_horizon = DAMP_TAU_DAYS * (1.0 - math.exp(-horizon / DAMP_TAU_DAYS)) if horizon > 0 else 0.0
+    players_target = fit_players_target(players_series, last_time, damped_horizon)
 
     rows = []
     for trophy, summary in zip(trophies, summaries):
@@ -288,13 +391,38 @@ def forecast_case(case):
         move = drift * damped_horizon
         move = min(MAX_LOGIT_MOVE, max(-MAX_LOGIT_MOVE, move))
         centre_logit = anchor + move
+        # Count view: shrink the earner growth slope like the drift, grow
+        # the last earner count over the damped horizon, and divide by the
+        # forecast player count. The implied rate's distance from the
+        # logit median is treated as model disagreement (see the header):
+        # it widens the spread below and never moves the median.
+        disagreement = 0.0
+        if (summary is not None and summary.get("count_fit") is not None
+                and summary.get("earners_last") is not None
+                and players_target and horizon > 0):
+            _c_anchor, c_slope, c_se, _c_resid, _c_n = summary["count_fit"]
+            c_se_adj = math.sqrt(c_se * c_se + MIN_SLOPE_SE ** 2)
+            c_precision = (count_scale ** 2) / (count_scale ** 2 + c_se_adj ** 2)
+            c_info = min(1.0, summary.get("distinct_earners", 0) / 4.0)
+            if summary["span_days"] < 0.05:
+                c_info *= 0.5
+            growth = count_centre + c_precision * c_info * (c_slope - count_centre)
+            growth = min(MAX_COUNT_SLOPE, max(-MAX_COUNT_SLOPE, growth))
+            earners_target = (summary["earners_last"] + COUNT_PSEUDO) * math.exp(
+                growth * damped_horizon) - COUNT_PSEUDO
+            earners_target = max(0.0, earners_target)
+            count_logit = logit_of_pct(100.0 * earners_target / players_target)
+            gap = abs(count_logit - centre_logit)
+            disagreement = min(DISAGREE_CAP,
+                               DISAGREE_COEF * min(gap, COUNT_MAX_DEVIATION))
         var = (
             RW_SIGMA ** 2 * horizon
             + 0.35 * resid_sd ** 2
             + (se_adj * damped_horizon) ** 2
-            + REFRESH_ALLOWANCE ** 2
+            + refresh_allowance(horizon) ** 2
+            + disagreement ** 2
         )
-        spread = min(MAX_SPREAD, max(MIN_SPREAD, math.sqrt(var)))
+        spread = min(MAX_SPREAD, max(spread_floor(horizon), math.sqrt(var)))
         quantiles = []
         previous = 0.0
         for z in z_scores:

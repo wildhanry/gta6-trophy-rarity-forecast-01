@@ -11,9 +11,11 @@ Three checks, all deterministic:
    so this mostly proves the model does not invent drift where none moved.
 
 2. Synthetic moving data: histories generated with known per-trophy logit
-   drifts (and a static control set). This is the test the practice cases
-   cannot give: an adaptive model must beat persistence when rates really
-   move, and must not lose badly when they do not.
+   drifts (and a static control set), plus a count-generated set where a
+   growing player count and per-trophy earner counts produce the rates.
+   This is the test the practice cases cannot give: an adaptive model
+   must beat persistence when rates really move, and must not lose badly
+   when they do not.
 
 3. Format validation of the .out files main.py writes for the practice
    cases: exact key shape, one row per trophy, five non-decreasing
@@ -140,6 +142,57 @@ def synthetic_case(base_rates, drifts, span_days=3.0, step_days=0.25,
     return case, actual
 
 
+def count_synthetic_case(base_rates):
+    """A case generated the way the real page is built: a player count
+    that grows fast and saturates, and per-trophy earner counts that grow
+    at their own rates, so each rate is earners / players at each read.
+    Trophies whose earners grow slower than the player count dilute."""
+    start_players = 2500.0
+
+    def players_at(t):
+        return start_players * math.exp((0.55 / 0.35) * (1.0 - math.exp(-0.35 * t)))
+
+    def earner_growth(j, base):
+        growth = 0.35 + 0.5 * math.sin(1.3 * j + 0.2)
+        if base < 5.0:
+            growth += 0.30
+        if base > 50.0:
+            growth -= 0.25
+        return growth
+
+    trophies = [{"id": i + 1} for i in range(len(base_rates))]
+    history = []
+    for k in range(13):
+        t = k * 0.25
+        players = players_at(t)
+        rates = []
+        for j, base in enumerate(base_rates):
+            earners = (base * start_players / 100.0) * math.exp(earner_growth(j, base) * t)
+            rates.append(round(min(99.99, max(0.01, 100.0 * earners / players)), 2))
+        history.append({
+            "slot": iso_from_days(EPOCH_DAY_ZERO + t),
+            "at": iso_from_days(EPOCH_DAY_ZERO + t),
+            "players_tracked": int(round(players)),
+            "trophies_earned": 9000,
+            "rates": rates,
+        })
+    players = players_at(4.0)
+    actual = []
+    for j, base in enumerate(base_rates):
+        earners = (base * start_players / 100.0) * math.exp(earner_growth(j, base) * 4.0)
+        actual.append(round(min(99.99, max(0.01, 100.0 * earners / players)), 2))
+    case = {
+        "id": "synthetic-counts",
+        "at": iso_from_days(EPOCH_DAY_ZERO + 3.0),
+        "target": iso_from_days(EPOCH_DAY_ZERO + 4.0),
+        "horizon_minutes": 1440.0,
+        "levels": LEVELS,
+        "trophies": trophies,
+        "history": history,
+    }
+    return case, actual
+
+
 def synthetic_report(base_rates):
     drifts = []
     for j, base in enumerate(base_rates):
@@ -160,7 +213,12 @@ def synthetic_report(base_rates):
         "ours": pinball_mean(forecast_case(still_case)["trophies"], still_actual),
         "baseline": pinball_mean(baseline_rows(still_case), still_actual),
     }
-    return {"moving": moving, "static": still}
+    count_case, count_actual = count_synthetic_case(base_rates)
+    counts = {
+        "ours": pinball_mean(forecast_case(count_case)["trophies"], count_actual),
+        "baseline": pinball_mean(baseline_rows(count_case), count_actual),
+    }
+    return {"moving": moving, "static": still, "count_moving": counts}
 
 
 def validate_outputs(input_dir):
