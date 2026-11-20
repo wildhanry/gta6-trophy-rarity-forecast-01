@@ -46,6 +46,21 @@ Model, per trophy
    hour and near-certain inside a week - from near zero for very short
    horizons to their full values for the final's multi-day horizon, and
    the total spread is capped so no trophy gets an absurd band.
+6. Regime gate on those extra spread terms. The terms beyond the
+   random-walk one are uncertainty about movement, and on a page that
+   has not observably moved they mostly price rounding noise twice:
+   backtests found the centre already equals persistence on flat data
+   while the extra terms alone cost several percent against it. So each
+   trophy's extra terms are scaled by a gate built from the observed
+   increments of its own series: the mean squared logit step per day is
+   an empirical diffusion rate for the page process (stale stretches of
+   repeated reads count, because the target is the page's own value),
+   pooled toward the case median rate with half a day of prior weight
+   so a sub-day history cannot set its own gate, and the gate is that
+   rate over itself plus the random-walk rate - near zero on a still
+   page, near one when the page moves faster than the baseline assumes.
+   The random-walk term itself is never gated: a still page can still
+   refresh once before the target.
 
 Fallbacks: a trophy with fewer than two usable reads keeps its last logit
 (or the case-wide median logit if it was never observed) and takes the
@@ -91,6 +106,7 @@ COUNT_MAX_DEVIATION = 2.0  # cap on the count view's logit distance used
 DISAGREE_COEF = 0.35       # share of the model disagreement added to spread
 DISAGREE_CAP = 0.6         # cap on that spread contribution, logit units
 MAX_COUNT_SLOPE = 1.5      # per-day cap on log count growth slopes
+ACTIVITY_PRIOR_DAYS = 0.5  # pooling weight (days) for the regime gate
 
 _NORMAL = NormalDist()
 
@@ -243,12 +259,30 @@ def fit_players_target(players_series, last_time, damped_horizon):
     return max(1.0, target)
 
 
+def increment_sums(points):
+    """Squared logit steps between consecutive reads and the days they
+    span. Repeated reads of an unchanged page add time but no step,
+    which is the point: the pair estimates how fast the page itself
+    moves, stale stretches included."""
+    sq = 0.0
+    days = 0.0
+    for earlier, later in zip(points, points[1:]):
+        gap = later[0] - earlier[0]
+        if gap <= 0:
+            continue
+        step = logit_of_pct(later[1]) - logit_of_pct(earlier[1])
+        sq += step * step
+        days += gap
+    return sq, days
+
+
 def fit_trophy(points, last_time):
     """First-pass per-trophy fit summary (no shrinkage yet): a logit fit
     for the rate itself and a log fit for the earner count behind it."""
     if not points:
         return None
     last_logit = logit_of_pct(points[-1][1])
+    incr_sq, incr_days = increment_sums(points)
     earners_last = None
     if points[-1][2] is not None:
         earners_last = points[-1][1] * float(points[-1][2]) / 100.0
@@ -261,6 +295,8 @@ def fit_trophy(points, last_time):
             "count_fit": None,
             "earners_last": earners_last,
             "distinct_earners": 0,
+            "incr_sq": incr_sq,
+            "incr_days": incr_days,
         }
     xs = []
     ys = []
@@ -292,6 +328,8 @@ def fit_trophy(points, last_time):
         "count_fit": count_fit,
         "earners_last": earners_last,
         "distinct_earners": len(set(earners_seen)),
+        "incr_sq": incr_sq,
+        "incr_days": incr_days,
     }
 
 
@@ -325,6 +363,7 @@ def forecast_case(case):
                 "last_logit": logit_of_pct(points[-1][1]),
                 "fit": None, "distinct": 1, "span_days": 0.0,
                 "count_fit": None, "earners_last": None, "distinct_earners": 0,
+                "incr_sq": 0.0, "incr_days": 0.0,
             })
         else:
             summaries.append(fit_trophy(points, last_time))
@@ -355,6 +394,13 @@ def forecast_case(case):
     else:
         count_centre = 0.0
         count_scale = 0.2
+
+    # Case-wide activity centre for the regime gate (point 6 of the
+    # header): the median per-trophy diffusion rate among the trophies
+    # whose reads span any time at all.
+    rates_seen = [s["incr_sq"] / s["incr_days"] for s in summaries
+                  if s and s.get("incr_days", 0.0) > 0]
+    activity_centre = median(rates_seen) if rates_seen else 0.0
 
     damped_horizon = DAMP_TAU_DAYS * (1.0 - math.exp(-horizon / DAMP_TAU_DAYS)) if horizon > 0 else 0.0
     players_target = fit_players_target(players_series, last_time, damped_horizon)
@@ -415,9 +461,23 @@ def forecast_case(case):
             gap = abs(count_logit - centre_logit)
             disagreement = min(DISAGREE_CAP,
                                DISAGREE_COEF * min(gap, COUNT_MAX_DEVIATION))
-        var = (
-            RW_SIGMA ** 2 * horizon
-            + 0.35 * resid_sd ** 2
+        # Regime gate: pool this trophy's diffusion rate toward the
+        # case centre with half a day of prior weight, then weigh the
+        # observed rate against the random-walk rate it would take for
+        # the extra spread terms to be the main story.
+        if summary is not None:
+            pooled = (
+                (summary.get("incr_sq", 0.0)
+                 + ACTIVITY_PRIOR_DAYS * activity_centre)
+                / (summary.get("incr_days", 0.0) + ACTIVITY_PRIOR_DAYS)
+            )
+            gate = pooled / (pooled + RW_SIGMA ** 2) if pooled > 0 else 0.0
+        else:
+            # Never observed at all: the uncertainty is about the level
+            # itself, not about movement, so the gate does not apply.
+            gate = 1.0
+        var = RW_SIGMA ** 2 * horizon + gate * (
+            0.35 * resid_sd ** 2
             + (se_adj * damped_horizon) ** 2
             + refresh_allowance(horizon) ** 2
             + disagreement ** 2

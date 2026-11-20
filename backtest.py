@@ -15,7 +15,12 @@ Three checks, all deterministic:
    growing player count and per-trophy earner counts produce the rates.
    This is the test the practice cases cannot give: an adaptive model
    must beat persistence when rates really move, and must not lose badly
-   when they do not.
+   when they do not. The same drift pattern is then walked over a grid of
+   scales, wiggles and horizons (0.5 to 4.5 days), and three stress sets
+   probe the regimes the grid cannot: reads jittered by measurement
+   noise around truly static rates, a page that stays flat then jumps
+   once at a refresh, and a final-like case with two days of reads and
+   a 4.5-day horizon.
 
 3. Format validation of the .out files main.py writes for the practice
    cases: exact key shape, one row per trophy, five non-decreasing
@@ -221,6 +226,148 @@ def synthetic_report(base_rates):
     return {"moving": moving, "static": still, "count_moving": counts}
 
 
+def pattern_drifts(base_rates):
+    """The per-trophy drift pattern of synthetic_report, factored out so
+    the grid below can rescale it without changing its shape."""
+    drifts = []
+    for j, base in enumerate(base_rates):
+        drift = 0.55 * math.sin(1.7 * j + 0.4)
+        if base < 5.0:
+            drift += 0.25
+        if base > 50.0:
+            drift -= 0.20
+        drifts.append(drift)
+    return drifts
+
+
+def jittered_static_case(base_rates, horizon_days=1.0, span_days=3.0,
+                         step_days=0.25):
+    """True rates never move; the reads carry small deterministic noise
+    around them and are rounded to two decimals like the real page, so a
+    fit can find spurious slopes in pure measurement jitter."""
+    trophies = [{"id": i + 1} for i in range(len(base_rates))]
+    history = []
+    steps = int(span_days / step_days)
+    for k in range(steps + 1):
+        t = k * step_days
+        rates = []
+        for j, base in enumerate(base_rates):
+            noise = (0.02 * math.sin(7.3 * k + 2.9 * j)
+                     + 0.013 * math.sin(3.1 * k * (j + 1) + 1.0))
+            pct = 100.0 / (1.0 + math.exp(-(logit_of_pct(base) + noise)))
+            rates.append(round(min(99.99, max(0.01, pct)), 2))
+        history.append({
+            "slot": iso_from_days(EPOCH_DAY_ZERO + t),
+            "at": iso_from_days(EPOCH_DAY_ZERO + t),
+            "players_tracked": 5000 + 700 * k,
+            "trophies_earned": 9000,
+            "rates": rates,
+        })
+    case = {
+        "id": "synthetic-jitter",
+        "at": iso_from_days(EPOCH_DAY_ZERO + span_days),
+        "target": iso_from_days(EPOCH_DAY_ZERO + span_days + horizon_days),
+        "horizon_minutes": horizon_days * 1440.0,
+        "levels": LEVELS,
+        "trophies": trophies,
+        "history": history,
+    }
+    return case, list(base_rates)
+
+
+def late_jump_case(base_rates, horizon_days=1.0, span_days=3.0,
+                   step_days=0.25, jump_at=1.5):
+    """Flat reads, then one refresh at jump_at moves every trophy by its
+    own logit offset, then a mild drift runs to the target. The shape a
+    launch-night page actually has: still, jump, settle."""
+    trophies = [{"id": i + 1} for i in range(len(base_rates))]
+    jumps = [0.45 * math.sin(2.3 * j + 0.7) for j in range(len(base_rates))]
+    drifts = [0.15 * math.sin(1.1 * j + 0.2) for j in range(len(base_rates))]
+
+    def centre(j, base, t):
+        value = logit_of_pct(base)
+        if t >= jump_at:
+            value += jumps[j] + drifts[j] * (t - jump_at)
+        return value
+
+    history = []
+    steps = int(span_days / step_days)
+    for k in range(steps + 1):
+        t = k * step_days
+        rates = []
+        for j, base in enumerate(base_rates):
+            pct = 100.0 / (1.0 + math.exp(-centre(j, base, t)))
+            rates.append(round(min(99.99, max(0.01, pct)), 2))
+        history.append({
+            "slot": iso_from_days(EPOCH_DAY_ZERO + t),
+            "at": iso_from_days(EPOCH_DAY_ZERO + t),
+            "players_tracked": 5000 + 700 * k,
+            "trophies_earned": 9000,
+            "rates": rates,
+        })
+    target_t = span_days + horizon_days
+    actual = []
+    for j, base in enumerate(base_rates):
+        pct = 100.0 / (1.0 + math.exp(-centre(j, base, target_t)))
+        actual.append(round(min(99.99, max(0.01, pct)), 2))
+    case = {
+        "id": "synthetic-jump",
+        "at": iso_from_days(EPOCH_DAY_ZERO + span_days),
+        "target": iso_from_days(EPOCH_DAY_ZERO + target_t),
+        "horizon_minutes": horizon_days * 1440.0,
+        "levels": LEVELS,
+        "trophies": trophies,
+        "history": history,
+    }
+    return case, actual
+
+
+def grid_report(base_rates):
+    """Walk the drift pattern over scales, wiggles and horizons. Every
+    cell is reported in the printout of main_cli via the returned rows;
+    nothing is averaged away before it can be inspected."""
+    pattern = pattern_drifts(base_rates)
+    rows = []
+    for scale in (0.0, 0.3, 0.55, 1.0):
+        factor = scale / 0.55 if scale else 0.0
+        drifts = [d * factor for d in pattern]
+        for wiggle in (0.0, 0.03):
+            for horizon in (0.5, 1.0, 2.0, 4.5):
+                case, actual = synthetic_case(
+                    base_rates, drifts, horizon_days=horizon, wiggle=wiggle)
+                rows.append({
+                    "scale": scale, "wiggle": wiggle, "horizon": horizon,
+                    "ours": pinball_mean(forecast_case(case)["trophies"], actual),
+                    "baseline": pinball_mean(baseline_rows(case), actual),
+                })
+    return rows
+
+
+def extra_report(base_rates):
+    """The non-grid stress sets: jittered static at two horizons, the
+    late-jump page, and a final-like case (two days of reads, a 4.5-day
+    horizon, the unscaled drift pattern)."""
+    out = {}
+    for horizon in (1.0, 4.5):
+        case, actual = jittered_static_case(base_rates, horizon_days=horizon)
+        out[f"jitter_h{horizon}"] = {
+            "ours": pinball_mean(forecast_case(case)["trophies"], actual),
+            "baseline": pinball_mean(baseline_rows(case), actual),
+        }
+    case, actual = late_jump_case(base_rates)
+    out["late_jump"] = {
+        "ours": pinball_mean(forecast_case(case)["trophies"], actual),
+        "baseline": pinball_mean(baseline_rows(case), actual),
+    }
+    case, actual = synthetic_case(base_rates, pattern_drifts(base_rates),
+                                  span_days=2.0, horizon_days=4.5)
+    out["final_like"] = {
+        "ours": pinball_mean(forecast_case(case)["trophies"], actual),
+        "baseline": pinball_mean(baseline_rows(case), actual),
+    }
+    return out
+
+
 def validate_outputs(input_dir):
     problems = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -282,6 +429,15 @@ def main_cli():
     synth = synthetic_report(base_rates)
     print("synthetic (1-day horizon after 3 days of reads):")
     for name, pair in synth.items():
+        print(f"  {name}: ours={pair['ours']:.6f} baseline={pair['baseline']:.6f}")
+    print("synthetic grid (drift scale x wiggle x horizon days):")
+    grid = grid_report(base_rates)
+    for row in grid:
+        print(f"  scale={row['scale']:.2f} wiggle={row['wiggle']:.2f} "
+              f"h={row['horizon']:.1f}: ours={row['ours']:.6f} "
+              f"baseline={row['baseline']:.6f}")
+    print("stress sets:")
+    for name, pair in extra_report(base_rates).items():
         print(f"  {name}: ours={pair['ours']:.6f} baseline={pair['baseline']:.6f}")
     problems = validate_outputs(input_dir)
     print("format validation:", "OK" if not problems else problems)
